@@ -36,17 +36,31 @@ async def process_threads_link(url, channel_id, thread_ts):
             
             image_items = []
             video_urls = []
-            region_div = soup.find('div', attrs={'role': 'region'})
+            main_region = soup.find('div', attrs={'role': 'region'})
+            post_container = None
+            if main_region:
+                # Buscamos el contenedor específico del post dentro de la región principal.
+                # El "True" indica que solo nos importa que el atributo exista.
+                post_container = main_region.find('div', attrs={'data-interactive-id': True})
             
-            if region_div:
-                print("   [BACKGROUND TASK] Searching for media directly within the region...")
-                for video_tag in region_div.find_all('video'):
-                    video_url = video_tag.get('src')
-                    print(f"   [BACKGROUND TASK] Found video URL: {video_url}")
+            if post_container:
+                print("   [BACKGROUND TASK] Searching for media within the post container...")
+                # Los videos en Threads a menudo usan un tag <source> dentro del tag <video>.
+                for video_tag in post_container.find_all('video'):
+                    video_url = None
+                    # Intentar encontrar la URL en el tag <source> anidado.
+                    source_tag = video_tag.find('source')
+                    if source_tag and source_tag.get('src'):
+                        video_url = source_tag.get('src')
+                    # Si no, como respaldo, buscar en el propio tag <video>.
+                    elif video_tag.get('src'):
+                        video_url = video_tag.get('src')
+                    
                     if video_url:
+                        print(f"   [BACKGROUND TASK] Found video URL: {video_url}")
                         video_urls.append(video_url)
                 
-                for picture_tag in region_div.find_all('picture'):
+                for picture_tag in post_container.find_all('picture'):
                     img_tag = picture_tag.find('img')
                     if not img_tag: continue
                     is_profile_pic = img_tag.get('height') == '36' and img_tag.get('width') == '36'
@@ -115,6 +129,7 @@ async def handle_app_mention(body, say):
 @app.event("reaction_added")
 async def handle_reaction(body, say):
     event = body['event']
+    match = None
     if event['reaction'] == 'eyes':
         print("\n✅ [EVENT RECEIVED] 'reaction_added' (eyes) event triggered. Acknowledging and starting background task.")
         channel_id = event['item']['channel']
