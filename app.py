@@ -2,6 +2,9 @@ import os
 import re
 import traceback
 import asyncio
+import tempfile
+import aiohttp
+import aiofiles
 from slack_bolt.async_app import AsyncApp
 from aiohttp import web
 from slack_bolt.adapter.aiohttp import to_bolt_request, to_aiohttp_response
@@ -27,10 +30,23 @@ async def process_threads_link(url, channel_id, thread_ts):
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
             print(f"   [BACKGROUND TASK] Page landed on: '{await page.title()}'")
 
-            print("   [BACKGROUND TASK] Waiting for the main post region...")
-            await page.wait_for_selector('div[role="region"]', timeout=20000)
+            main_region_selector = 'div[role="region"]'
+            print(f"   [BACKGROUND TASK] Waiting for the main post region ('{main_region_selector}')...")
+            await page.wait_for_selector(main_region_selector, timeout=20000)
             
-            print("   [BACKGROUND TASK] Region found! Extracting page content...")
+            # Una vez que la región principal existe, esperamos a que aparezca un video O una imagen dentro de ella.
+            # Esto soluciona la condición de carrera de forma más robusta, sin depender de la estructura interna de divs.
+            media_selector = f'{main_region_selector} video, {main_region_selector} picture'
+            print(f"   [BACKGROUND TASK] Waiting for media to appear ('{media_selector}')...")
+            try:
+                # Esperamos hasta 15 segundos por si la red es lenta para cargar el video/imagen.
+                await page.wait_for_selector(media_selector, timeout=15000)
+                print("   [BACKGROUND TASK] Media found! Extracting page content...")
+            except Exception: # Playwright's TimeoutError
+                print("   [BACKGROUND TASK] Timed out waiting for media. Proceeding without it.")
+                # No es necesario hacer nada, el código posterior manejará el caso sin medios.
+                pass
+
             content = await page.content()
             soup = BeautifulSoup(content, 'html.parser')
             
@@ -47,13 +63,16 @@ async def process_threads_link(url, channel_id, thread_ts):
                 print("   [BACKGROUND TASK] Searching for media within the post container...")
                 # Los videos en Threads a menudo usan un tag <source> dentro del tag <video>.
                 for video_tag in post_container.find_all('video'):
+                    print("   [BACKGROUND TASK] Video tag found!")
                     video_url = None
                     # Intentar encontrar la URL en el tag <source> anidado.
                     source_tag = video_tag.find('source')
                     if source_tag and source_tag.get('src'):
+                        print("   [BACKGROUND TASK] Inner Source tag found! ")
                         video_url = source_tag.get('src')
                     # Si no, como respaldo, buscar en el propio tag <video>.
                     elif video_tag.get('src'):
+                        print("   [BACKGROUND TASK] src atttributee found!")
                         video_url = video_tag.get('src')
                     
                     if video_url:
@@ -81,17 +100,36 @@ async def process_threads_link(url, channel_id, thread_ts):
                         blocks=blocks, text="Imágenes de Threads"
                     )
                 
-                # Post video URLs in separate messages to trigger Slack's unfurler
+                # Download videos and upload them as files
                 if video_urls:
                     await app.client.chat_postMessage(
                         channel=channel_id, thread_ts=thread_ts,
                         text=f"He encontrado {len(video_urls)} video(s):"
                     )
-                    for url in video_urls:
-                        await app.client.chat_postMessage(
-                            channel=channel_id, thread_ts=thread_ts,
-                            text=url, unfurl_links=True, unfurl_media=True
-                        )
+                    for video_url in video_urls:
+                        # Usar un gestor de contexto para la sesión y el archivo temporal
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(video_url) as resp:
+                                if resp.status == 200:
+                                    # Crear un archivo temporal, obtener su nombre y cerrarlo inmediatamente.
+                                    # Esto evita el PermissionError en Windows.
+                                    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                                    tmp_file_path = tmp_file.name
+                                    tmp_file.close()
+
+                                    try:
+                                        # Escribir el contenido del video en el archivo temporal.
+                                        async with aiofiles.open(tmp_file_path, 'wb') as f:
+                                            await f.write(await resp.read())
+                                        print(f"   [BACKGROUND TASK] Video descargado en: {tmp_file_path}")
+
+                                        # Subir el archivo a Slack.
+                                        await app.client.files_upload_v2(
+                                            channel=channel_id, thread_ts=thread_ts,
+                                            file=tmp_file_path, initial_comment="Video de Threads:"
+                                        )
+                                    finally:
+                                        os.remove(tmp_file_path) # Asegurarse de borrar el archivo temporal.
                 print(f"✅ [BACKGROUND TASK] Success! Posted {len(image_items)} images and {len(video_urls)} videos to Slack.")
             else:
                 await app.client.chat_postMessage(

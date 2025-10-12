@@ -2,3 +2,4 @@ slack_bolt
 beautifulsoup4
 playwright
 aiohttp
+aiofiles
